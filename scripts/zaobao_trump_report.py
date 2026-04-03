@@ -23,12 +23,12 @@ STATE_DIR = PROJECT_ROOT / "state"
 REPORT_RETENTION_DAYS = 30
 BLOCKLIST_PHRASES = {
     "This is a modal window.",
-    "打开对话窗口。Escape键将取消并关闭对话窗口",
+    "打开对话窗口。Escape键将取消并关闭对话窗口。",
     "结束对话窗口",
     "播放视频",
     "播放 API 请求失败，原因未知",
     "错误代码: VIDEO_CLOUD_ERR_UNKNOWN",
-    "技术细节 :",
+    "技术细节:",
     "确定",
     "关闭弹窗",
     "延伸阅读",
@@ -68,7 +68,7 @@ class TrumpSpeechConfig:
     max_articles: int
     playwright_headless: bool
     playwright_timeout_seconds: int
-    speech_keywords: tuple[str, ...]
+    browser_executable_path: str
     llm: LLMConfig
     notification_exe: str
     notification_channel: str
@@ -79,12 +79,6 @@ class TrumpSpeechConfig:
         search_url = os.getenv("SEARCH_URL", "").strip()
         if not search_url:
             search_url = f"https://www.zaobao.com.sg/sitesearch?r={quote(search_query)}"
-        keywords = tuple(
-            keyword.strip() for keyword in os.getenv(
-                "SPEECH_KEYWORDS",
-                "讲话,演讲,发言,称,表示,宣称,宣布,下令,威胁,誓言,呼吁,说,谈到",
-            ).split(",") if keyword.strip()
-        )
         return cls(
             scrape_time=os.getenv("SCRAPE_TIME", "19:00").strip(),
             search_query=search_query,
@@ -93,7 +87,7 @@ class TrumpSpeechConfig:
             max_articles=max(1, int(os.getenv("MAX_ARTICLES", "6"))),
             playwright_headless=os.getenv("PLAYWRIGHT_HEADLESS", "true").strip().lower() != "false",
             playwright_timeout_seconds=max(30, int(os.getenv("PLAYWRIGHT_TIMEOUT_SECONDS", "120"))),
-            speech_keywords=keywords,
+            browser_executable_path=os.getenv("PLAYWRIGHT_EXECUTABLE_PATH", "").strip(),
             llm=LLMConfig(
                 api_key=os.getenv("DASHSCOPE_API_KEY", "").strip(),
                 base_url=os.getenv("DASHSCOPE_BASE_URL", "https://coding.dashscope.aliyuncs.com/v1").strip(),
@@ -144,16 +138,15 @@ class TrumpSpeechReporter:
         if not results:
             raise Exception("搜索结果为空，未抓到任何候选文章。")
         if not articles:
-            raise Exception("没有找到符合“特朗普讲话/表态”条件的正文文章。")
+            raise Exception(f"没有找到包含“{self.config.search_query}”的正文文章。")
+
+        digests = self._summarize_articles(articles)
+        for article, digest in zip(articles, digests):
+            article["llm_digest"] = digest
 
         report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        analysis = self._call_llm(self._build_llm_input(articles)).strip()
-        notification_message = self._format_notification_message(
-            generated_at=report_time,
-            result_count=len(results),
-            articles=articles,
-            analysis=analysis,
-        )
+        analysis = self._call_analysis_llm(self._build_analysis_input(articles)).strip()
+        notification_message = self._format_notification_message(articles)
 
         return {
             "generated_at": report_time,
@@ -168,20 +161,23 @@ class TrumpSpeechReporter:
             "config": {
                 "max_results": self.config.max_results,
                 "max_articles": self.config.max_articles,
-                "speech_keywords": list(self.config.speech_keywords),
+                "search_query": self.config.search_query,
                 "model": self.config.llm.model,
+                "browser_executable_path": self._resolve_browser_executable() or "",
             },
         }
 
     def _scrape_zaobao(self) -> tuple[list[dict], list[dict]]:
         self.logger.log(f"开始抓取搜索页: {self.config.search_url}")
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.config.playwright_headless)
+            browser = p.chromium.launch(
+                headless=self.config.playwright_headless,
+                executable_path=self._resolve_browser_executable(),
+            )
             context = browser.new_context()
             try:
                 results = self._collect_search_results(context)
-                filtered = [item for item in results if self._is_speech_related(item)]
-                selected = filtered[: self.config.max_articles]
+                selected = results
                 articles = [self._extract_article(context, item) for item in selected]
                 articles = [item for item in articles if item]
                 return results, articles
@@ -194,23 +190,36 @@ class TrumpSpeechReporter:
         page.set_default_timeout(self.config.playwright_timeout_seconds * 1000)
         page.goto(self.config.search_url, wait_until="domcontentloaded")
         page.wait_for_function(
-            """(query) => Array.from(document.querySelectorAll("a[href*='/story']")).some(
-                (a) => (a.innerText || '').includes(query)
+            """() => Array.from(document.querySelectorAll("main a[href*='/story']")).some(
+                (a) => {
+                    const href = a.getAttribute('href') || '';
+                    const text = (a.innerText || '').trim();
+                    return !href.includes('ref=sidebar') && text.includes('\\n');
+                }
             )""",
-            arg=self.config.search_query,
         )
         raw_items = page.evaluate(
-            """() => Array.from(document.querySelectorAll("a[href*='/story']")).map((a) => ({
+            """() => Array.from(document.querySelectorAll("main a[href*='/story']")).map((a) => ({
                 href: a.href,
-                text: (a.innerText || '').trim()
+                rawHref: a.getAttribute('href') || '',
+                text: (a.innerText || '').trim(),
+                className: a.className || ''
             }))"""
         )
         results: list[dict] = []
         seen: set[str] = set()
         for item in raw_items:
             href = (item.get("href") or "").split("?")[0]
+            raw_href = item.get("rawHref") or ""
             text = item.get("text") or ""
+            class_name = item.get("className") or ""
             if not href or href in seen or "zaobao.com.sg" not in href:
+                continue
+            if "ref=sidebar" in raw_href:
+                continue
+            if "max-lg:min-h-[136px]" not in class_name:
+                continue
+            if "\n" not in text:
                 continue
             lines = [line.strip() for line in text.splitlines() if line.strip()]
             if not lines:
@@ -266,7 +275,7 @@ class TrumpSpeechReporter:
                 "updated_at": self._extract_meta(data.get("metaTexts", []), "更新"),
                 "content": "\n\n".join(paragraphs),
             }
-            return article if self._is_speech_related(article) else None
+            return article
         finally:
             page.close()
 
@@ -297,17 +306,7 @@ class TrumpSpeechReporter:
                 return value
         return ""
 
-    def _is_speech_related(self, item: dict) -> bool:
-        haystack = "\n".join(
-            [
-                str(item.get("title", "")),
-                str(item.get("summary", "")),
-                str(item.get("content", ""))[:500],
-            ]
-        )
-        return any(keyword in haystack for keyword in self.config.speech_keywords)
-
-    def _build_llm_input(self, articles: list[dict]) -> str:
+    def _build_analysis_input(self, articles: list[dict]) -> str:
         parts: list[str] = []
         for index, article in enumerate(articles, start=1):
             parts.append(
@@ -317,7 +316,7 @@ class TrumpSpeechReporter:
                         f"标题：{article['title']}",
                         f"链接：{article['url']}",
                         f"发布时间：{article.get('published_at') or article.get('published_hint')}",
-                        f"摘要：{article.get('summary', '')}",
+                        f"搜索摘要：{article.get('summary', '')}",
                         "正文：",
                         article["content"],
                     ]
@@ -325,32 +324,111 @@ class TrumpSpeechReporter:
             )
         return "\n\n".join(parts)
 
-    def _call_llm(self, content: str) -> str:
-        system_prompt = (
-            "你是一位政治与国际新闻分析编辑，负责整理特朗普近期讲话、表态和政策动作。"
-            "请只基于用户提供的文章内容，输出简洁中文 Markdown。"
-            "输出必须包含：今日讲话重点、核心表态、政策信号、市场与地缘影响、观察。"
-            "不要输出 #、##、### 标题；如果使用标题，最高只能使用 ####。"
-            "不要编造未出现的信息。"
+    def _build_digest_input(self, articles: list[dict]) -> str:
+        parts: list[str] = []
+        for index, article in enumerate(articles, start=1):
+            parts.append(
+                "\n".join(
+                    [
+                        f"[文章{index}]",
+                        f"标题：{article['title']}",
+                        f"发布时间：{article.get('published_at') or article.get('published_hint')}",
+                        f"搜索摘要：{article.get('summary', '')}",
+                        "正文：",
+                        article["content"],
+                    ]
+                )
+            )
+        return "\n\n".join(parts)
+
+    def _resolve_browser_executable(self) -> str | None:
+        if self.config.browser_executable_path:
+            return self.config.browser_executable_path
+        base = Path.home() / ".cache" / "ms-playwright"
+        candidates = sorted(base.glob("chromium-*/chrome-linux64/chrome"), reverse=True)
+        if candidates:
+            return str(candidates[0])
+        return None
+
+    def _summarize_articles(self, articles: list[dict]) -> list[str]:
+        prompt = self._build_digest_input(articles)
+        response_text = self._call_llm(
+            system_prompt=(
+                "你是新闻摘要编辑。请阅读每篇文章内容，按输入顺序输出一个 JSON 数组。"
+                "数组每个元素是对应文章的一句话中文摘要。"
+                "要求："
+                "1. 必须基于正文，不要照搬标题。"
+                "2. 每条摘要 30 到 120 个汉字，尽量点出动作、表态或影响。"
+                "3. 不要编号，不要项目名，不要 Markdown，不要解释。"
+                "4. 只返回 JSON 数组。"
+            ),
+            user_content=prompt,
+            max_tokens=1800,
         )
+        digests = self._parse_json_array(response_text)
+        normalized: list[str] = []
+        for index, article in enumerate(articles):
+            if index < len(digests):
+                digest = self._normalize_digest(str(digests[index]))
+                if digest:
+                    normalized.append(digest)
+                    continue
+            normalized.append(self._fallback_digest(article))
+        return normalized
+
+    def _call_analysis_llm(self, content: str) -> str:
+        return self._normalize_markdown(
+            self._call_llm(
+                system_prompt=(
+                    "你是一位政治与国际新闻分析编辑，负责整理特朗普近期讲话、表态和政策动作。"
+                    "请只基于用户提供的文章内容，输出简洁中文 Markdown。"
+                    "输出必须包含：今日讲话重点、核心表态、政策信号、市场与地缘影响、观察。"
+                    "不要输出 #、##、### 标题；如果使用标题，最高只允许 ####。"
+                    "不要编造未出现的信息。"
+                ),
+                user_content=content,
+                max_tokens=4000,
+            )
+        )
+
+    def _call_llm(self, system_prompt: str, user_content: str, max_tokens: int) -> str:
         payload = {
             "model": self.config.llm.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": content},
+                {"role": "user", "content": user_content},
             ],
             "temperature": 0.3,
-            "max_tokens": 4000,
+            "max_tokens": max_tokens,
         }
         headers = {
             "Authorization": f"Bearer {self.config.llm.api_key}",
             "Content-Type": "application/json",
         }
         url = f"{self.config.llm.base_url.rstrip('/')}/chat/completions"
-        response = requests.post(url, headers=headers, json=payload, timeout=180)
+        session = requests.Session()
+        session.trust_env = False
+        response = session.post(url, headers=headers, json=payload, timeout=180)
         response.raise_for_status()
         data = response.json()
-        return self._normalize_markdown(data["choices"][0]["message"]["content"])
+        return data["choices"][0]["message"]["content"].strip()
+
+    def _parse_json_array(self, text: str) -> list[str]:
+        candidates = [text.strip()]
+        fence_match = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
+        if fence_match:
+            candidates.insert(0, fence_match.group(1).strip())
+        bare_match = re.search(r"(\[[\s\S]*\])", text)
+        if bare_match:
+            candidates.insert(0, bare_match.group(1).strip())
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, list):
+                return [str(item).strip() for item in data]
+        return []
 
     def _normalize_markdown(self, text: str) -> str:
         lines: list[str] = []
@@ -364,25 +442,47 @@ class TrumpSpeechReporter:
                 lines.append(line)
         return "\n".join(lines).strip()
 
-    def _format_notification_message(
-        self,
-        generated_at: str,
-        result_count: int,
-        articles: list[dict],
-        analysis: str,
-    ) -> str:
-        header = [
-            f"特朗普讲话追踪 | {generated_at}",
-            f"搜索结果：{result_count} 条 | 入选文章：{len(articles)} 篇",
-            "",
-            "#### 本次纳入文章",
-        ]
-        lines = header[:]
+    def _format_notification_message(self, articles: list[dict]) -> str:
+        lines: list[str] = []
         for index, article in enumerate(articles, start=1):
-            publish_value = article.get("published_at") or article.get("published_hint") or "时间未知"
-            lines.append(f"{index}. {article['title']} | {publish_value}")
-        lines.extend(["", analysis])
-        return "\n".join(lines)
+            lines.append(f"{index}. {article['title']}")
+            lines.append("")
+            lines.append(self._article_digest(article))
+            if index != len(articles):
+                lines.append("")
+        return "\n".join(lines).strip()
+
+    def _article_digest(self, article: dict) -> str:
+        llm_digest = self._normalize_digest(article.get("llm_digest", ""))
+        if llm_digest:
+            return llm_digest
+        return self._fallback_digest(article)
+
+    def _fallback_digest(self, article: dict) -> str:
+        summary = self._condense_text(article.get("summary") or "")
+        if summary:
+            return summary
+        return self._condense_text(article.get("content") or "")
+
+    def _normalize_digest(self, text: str) -> str:
+        value = " ".join(str(text).split()).strip()
+        if not value:
+            return ""
+        value = re.sub(r"^[\-*•\d\.\)\s]+", "", value)
+        value = value.replace("摘要：", "").replace("总结：", "").strip()
+        if len(value) <= 120:
+            return value
+        return value[:120].rstrip() + "..."
+
+    def _condense_text(self, text: str) -> str:
+        value = " ".join(text.split()).strip()
+        if not value:
+            return ""
+        parts = re.split(r"(?<=[。！？!?])\s*", value, maxsplit=1)
+        first_sentence = parts[0].strip() if parts else value
+        if len(first_sentence) <= 120:
+            return first_sentence
+        return first_sentence[:120].rstrip() + "..."
 
     def _save_report(self, report: dict) -> None:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -390,7 +490,6 @@ class TrumpSpeechReporter:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         payload = json.dumps(report, ensure_ascii=False, indent=2)
         markdown = report.get("notification_message", "").strip() + "\n"
-
         (STATE_DIR / "latest_report.json").write_text(payload, encoding="utf-8")
         (STATE_DIR / f"report-{timestamp}.json").write_text(payload, encoding="utf-8")
         (OUTPUT_DIR / "latest_report.md").write_text(markdown, encoding="utf-8")
